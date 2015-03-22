@@ -12,9 +12,12 @@
 extern crate getopts;
 
 use std::cell::{Cell, RefCell};
-use std::old_io::fs;
-use std::old_io::fs::PathExtensions;
+use std::env;
+use std::fs;
+use std::fs::PathExt;
+use std::path::{Path, PathBuf};
 use std::old_io;
+use std::old_io::Writer;
 use std::os;
 use std::result::Result;
 use std::rand;
@@ -82,7 +85,7 @@ impl Iterator for FilenameGenerator {
         
         if nameset_indices[0] == NAMESET.len()-1 { self.exhausted.set(true) }
         // Now increment the least significant index
-        for i in range(0, self.name_len).rev() {
+        for i in (0..self.name_len).rev() {
             if nameset_indices[i] == NAMESET.len()-1 {
                 nameset_indices[i] = 0; // Carry the 1
                 continue;
@@ -196,8 +199,9 @@ fn get_size(size_str_opt: Option<String>, prog_name: &str) -> Option<u64> {
     Some(coeff*unit)
 }
 
-pub fn uumain(args: Vec<String>) -> isize {
-    let prog_name: String = format!("{}", Path::new(args[0].as_slice()).filename_display());
+pub fn main() {
+    let args = env::args().collect();
+    let prog_name: String = format!("{}", Path::new(args[0].as_slice()).filname_display());
 
     let opts = [
         getopts::optopt("n", "iterations", "overwrite N times instead of the default (3)", "N"),
@@ -284,14 +288,14 @@ fn wipe_file(path_str: &str, n_passes: usize, prog_name: &str,
 
     // Get these potential errors out of the way first
     let path = Path::new(path_str);
-    if !path.exists() { eprintln!("{}: {}: No such file or directory", prog_name, path.display()); return; }
-    if !path.is_file() { eprintln!("{}: {}: Not a file", prog_name, path.display()); return; }
+    if !path.exists() { eprintln!("{}: {}: No such file or directory", prog_name, path.filname_display()); return; }
+    if !path.is_file() { eprintln!("{}: {}: Not a file", prog_name, path.filname_display()); return; }
     
     let mut file = match fs::File::open_mode(&path, old_io::Open, old_io::Write) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("{}: {}: Couldn't open file for writing: {}", prog_name,
-                                                                    path.filename_display(), e.desc);
+                                                                    path.filname_display(), e.desc);
             return;
         }
     };
@@ -332,10 +336,10 @@ fn wipe_file(path_str: &str, n_passes: usize, prog_name: &str,
     for (i, pass_type) in pass_sequence.iter().enumerate() {
         if verbose {
             if total_passes.to_string().len() == 1 {
-                print!("{}: {}: pass {}/{} ", prog_name, path.filename_display(), i+1, total_passes);
+                print!("{}: {}: pass {}/{} ", prog_name, path.filname_display(), i+1, total_passes);
             }
             else {
-                print!("{}: {}: pass {:2.0}/{:2.0} ", prog_name, path.filename_display(), i+1, total_passes);
+                print!("{}: {}: pass {:2.0}/{:2.0} ", prog_name, path.filname_display(), i+1, total_passes);
             }
             match *pass_type {
                 PassType::Random => println!("(random)"),
@@ -349,7 +353,7 @@ fn wipe_file(path_str: &str, n_passes: usize, prog_name: &str,
     }
     
     if remove {
-        let renamed_path: Option<Path> = wipe_name(&path, prog_name, true);
+        let renamed_path: Option<PathBuf> = wipe_name(&path, prog_name, true);
         match renamed_path {
             Some(rp) => { remove_file(&rp, path.filename_str().unwrap_or(""), prog_name, verbose); }
             None => (),
@@ -360,11 +364,11 @@ fn wipe_file(path_str: &str, n_passes: usize, prog_name: &str,
 fn do_pass(file: &mut fs::File, generator_type: PassType,
            given_file_size: Option<u64>, exact: bool, prog_name: &str) -> Result<(), ()> {
            
-    let real_file_size = match file.stat() {
-        Ok(stat) => stat.size,
+    let real_file_size = match file.metadata() {
+        Ok(metadata) => metadata.len(),
         Err(e) => {
                 eprintln!("{}: {}: Couldn't stat file: {}", prog_name,
-                                                            file.path().filename_display(),
+                                                            file.path().filname_display(),
                                                             e.desc);
                 return Err(());
             }
@@ -381,7 +385,7 @@ fn do_pass(file: &mut fs::File, generator_type: PassType,
             Ok(_) => (),
             Err(e) => {
                 eprintln!("{}: {}: Couldn't write to file: {}", prog_name,
-                                                                file.path().filename_display(),
+                                                                file.path().filname_display(),
                                                                 e.desc);
                 return Err(());
             }
@@ -392,8 +396,8 @@ fn do_pass(file: &mut fs::File, generator_type: PassType,
 
 // Repeatedly renames the file with strings of decreasing length (most likely all 0s)
 // Return the path of the file after its last renaming or None if error
-fn wipe_name(file_path: &Path, prog_name: &str, verbose: bool) -> Option<Path> {
-    let basename_len: usize = format!("{}", file_path.filename_display()).len();
+fn wipe_name(file_path: &Path, prog_name: &str, verbose: bool) -> Option<PathBuf> {
+    let basename_len: usize = format!("{}", file_path.filname_display()).len();
     let mut prev_path = file_path.clone();
     let dir_path: Path = file_path.dir_path();
     
@@ -402,17 +406,17 @@ fn wipe_name(file_path: &Path, prog_name: &str, verbose: bool) -> Option<Path> {
         Ok(f) => f,
         Err(e) => {
             eprintln!("{}: {}: Couldn't open directory as read-only", prog_name,
-                                                                      dir_path.display());
+                                                                      dir_path.filname_display());
             return None;
         }
     };
     
-    let mut last_path: Path = Path::new(""); // for use inside the loop
+    let mut last_path: Path = Path::new(""); // for use inside the loop;
     
-    for length in range(1, basename_len+1).rev() {
+    for length in (1..basename_len+1).rev() {
         for name in FilenameGenerator::new(length) {
             let new_path = dir_path.join(name.as_slice());
-            match fs::stat(&new_path) {
+            match new_path.metadata() {
                 Err(_) => (), // Good. We don't want the filename to already exist (don't overwrite)
                 Ok(_) => continue, // If it does, find another name that doesn't
             }
@@ -420,38 +424,38 @@ fn wipe_name(file_path: &Path, prog_name: &str, verbose: bool) -> Option<Path> {
                 Ok(()) => {
                     if verbose {
                         println!("{}: {}: renamed to {}", prog_name,
-                                                          prev_path.filename_display(),
-                                                          new_path.filename_display());
+                                                          prev_path.filname_display(),
+                                                          new_path.filname_display());
                     }
                     // Sync this change to disk immediately; Note: this is equivalent to the
                     // --remove=wipesync option in coreutils' shred. Here, it is the only option
                     dir_file.fsync();
                     
-                    last_path = new_path.clone();
-                    prev_path = new_path;
+                    last_path = &new_path.clone();
+                    prev_path = &new_path;
                     break;
                 }
                 Err(e) => {
                     eprintln!("{}: {}: Couldn't rename to {}: {}", prog_name,
-                                                                   prev_path.filename_display(),
-                                                                   new_path.filename_display(),
+                                                                   prev_path.filname_display(),
+                                                                   new_path.filname_display(),
                                                                    e.desc);
                     return None;
                 }
             }
         } // If every possible filename already exists, just reduce the length and try again
     }
-    return Some(last_path);
+    return Some(last_path.to_path_buf());
 }
 
 fn remove_file(path: &Path, orig_filename: &str, prog_name: &str, verbose: bool) -> Result<(), ()> {
-    match fs::unlink(path) {
+    match fs::remove_file(path) {
         Ok(_) => {
             if verbose { println!("{}: {}: removed", prog_name, orig_filename); }
             Ok(())
         }
         Err(e) => {
-            eprintln!("{}: {}: Couldn't remove {}", prog_name, path.filename_display(), e.desc);
+            eprintln!("{}: {}: Couldn't remove {}", prog_name, path.filname_display(), e.desc);
             Err(())
         }
     }
