@@ -1,27 +1,39 @@
 #![crate_name = "shred"]
-#![feature(collections, core, io, libc, os, path, rand)]
+#![feature(file_path, path_ext, collections)]
 /*
-* This file is part of the uutils coreutils package.
-*
-* (c) Michael Rosenberg <42micro@gmail.com>
-*
-* For the full copyright and license information, please view the LICENSE
-* file that was distributed with this source code.
+ * This file is part of the uutils coreutils package.
+ *
+ * (c) Michael Rosenberg <42micro@gmail.com>
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+
+/*
+ TODO:
+     * MAKE FASTER
+     * handle all errors
+     * make own error types for cleaner code
+     * concurrency(?)
 */
 
 extern crate getopts;
 
+extern crate rand;
+use rand::{ThreadRng, Rng};
+
 use std::cell::{Cell, RefCell};
 use std::env;
 use std::fs;
+use std::io::Seek;
+use std::io::Write;
 use std::fs::PathExt;
+use std::path;
 use std::path::{Path, PathBuf};
-use std::old_io;
-use std::old_io::Writer;
-use std::os;
+use std::io;
 use std::result::Result;
-use std::rand;
-use std::rand::{ThreadRng, Rng};
+use std::error::Error;
 
 #[path = "../common/util.rs"]
 #[macro_use]
@@ -42,7 +54,7 @@ const PATTERNS: [&'static [u8]; 22] = [
         b"\xDD", b"\xEE",
 ];
 
-#[derive(Copy)]
+#[derive(Clone, Copy)]
 enum PassType<'a> {
     Pattern(&'a [u8]),
     Random,
@@ -80,7 +92,7 @@ impl Iterator for FilenameGenerator {
         // Make the return value, then increment
         let mut ret = String::new();
         for i in nameset_indices.iter() {
-            ret.push(NAMESET.char_at(*i));
+            ret.push(NAMESET.chars().nth(*i).unwrap());
         }
         
         if nameset_indices[0] == NAMESET.len()-1 { self.exhausted.set(true) }
@@ -152,7 +164,7 @@ impl<'a> Iterator for BytesGenerator<'a> {
                 let mut rng = self.rng.as_ref().unwrap().borrow_mut();
                 unsafe {
                     bytes.set_len(this_block_size);
-                    rng.fill_bytes(bytes.as_mut_slice());
+                    rng.fill_bytes(&mut bytes);
                 }
             }
             PassType::Pattern(pattern) => {
@@ -174,48 +186,58 @@ impl<'a> Iterator for BytesGenerator<'a> {
     }
 }
 
-// TODO: Add support for all postfixes here up to and including EiB
-//       http://www.gnu.org/software/coreutils/manual/coreutils.html#Block-size
 fn get_size(size_str_opt: Option<String>, prog_name: &str) -> Option<u64> {
     if size_str_opt.is_none() { return None; }
     
-    let mut size_str = size_str_opt.as_ref().unwrap().clone();
-    // Immutably look at last character of size string
-    let unit = match size_str.as_slice().char_at_reverse(size_str.len()) {
-        'K' => { size_str.pop();  1024u64 }
-        'M' => { size_str.pop(); (1024*1024) as u64 }
-        'G' => { size_str.pop(); (1024*1024*1024) as u64 }
-         _   => { 1u64 }
+    let size_str = size_str_opt.as_ref().unwrap();
+
+    let num_str = size_str.chars().take_while(|c| c.is_digit(10)).collect::<String>();
+    let suffix = size_str.chars().skip(num_str.len()).collect::<String>();
+
+    let multiplier = match suffix.as_ref() {
+        "" | "c" => 1,
+        "w" => 2,
+        "b" => 512,
+        "kB" => 1000,
+        "K" | "KiB" | "k" => 1024,
+        "MB" => 1000 * 1000,
+        "M" | "MiB" => 1024 * 1024,
+        "GB" => 1000 * 1000 * 1000,
+        "G" | "GiB" => 1024 * 1024 * 1024,
+        "TB" => 1000 * 1000 * 1000 * 1000,
+        "T" | "TiB" => 1024 * 1024 * 1024 * 1024,
+        "PB" => 1000 * 1000 * 1000 * 1000 * 1000,
+        "P" | "PiB" => 1024 * 1024 * 1024 * 1024 * 1024,
+        "EB" => 1000 * 1000 * 1000 * 1000 * 1000 * 1000,
+        "E" | "EiB" => 1024 * 1024 * 1024 * 1024 * 1024 * 1024,
+        _ => 0
     };
     
-    let coeff = match size_str.parse::<u64>() {
-        Ok(u) => u,
-        Err(_) => {
-            eprintln!("{}: {}: Invalid file size", prog_name, size_str_opt.unwrap());
-            exit!(1);
-        }
-    };
+    let val = num_str.parse::<u64>().unwrap_or(0) * multiplier;
+    if val == 0 {
+        eprintln!("{}: {}: Invalid file size", prog_name, &size_str);
+        exit!(1);
+    }
     
-    Some(coeff*unit)
+    Some(val)
 }
 
 pub fn main() {
-    let args = env::args().collect();
-    let prog_name: String = format!("{}", Path::new(args[0].as_slice()).filname_display());
+    let args: Vec<String> = env::args().collect();
+    let prog_name: String = Path::new(&args[0]).filename_str();
 
-    let opts = [
-        getopts::optopt("n", "iterations", "overwrite N times instead of the default (3)", "N"),
-        getopts::optopt("s", "size", "shred this many bytes (suffixes like K, M, G accepted)", "FILESIZE"),
-        getopts::optflag("u", "remove", "truncate and remove the file after overwriting; See below"),
-        getopts::optflag("v", "verbose", "show progress"),
-        getopts::optflag("x", "exact", "do not round file sizes up to the next full block;\
-                                        this is the default for non-regular files"),
-        getopts::optflag("z", "zero", "add a final overwrite with zeros to hide shredding"),
-        getopts::optflag("", "help", "display this help and exit"),
-        getopts::optflag("", "version", "output version information and exit"),
-    ];
+    let mut opts = getopts::Options::new();
+    opts.optopt("n", "iterations", "overwrite N times instead of the default (3)", "N");
+    opts.optopt("s", "size", "shred this many bytes (suffixes like K, M, G accepted)", "FILESIZE");
+    opts.optflag("u", "remove", "truncate and remove the file after overwriting; See below");
+    opts.optflag("v", "verbose", "show progress");
+    opts.optflag("x", "exact", "do not round file sizes up to the next full block;\
+                                    this is the default for non-regular files");
+    opts.optflag("z", "zero", "add a final overwrite with zeros to hide shredding");
+    opts.optflag("", "help", "display this help and exit");
+    opts.optflag("", "version", "output version information and exit");
     
-    let matches = match getopts::getopts(args.tail(), &opts) {
+    let matches = match opts.parse(args.tail()) {
         Ok(m) => m,
         Err(f) => {
             eprintln!("{}: {}", prog_name, f);
@@ -227,7 +249,7 @@ pub fn main() {
         println!("Usage: {} [OPTION]... FILE...", prog_name);
         println!("Overwrite the specified FILE(s) repeatedly, in order to make it harder");
         print!("for even very expensive hardware probing to recover the data.");
-        println!("{}", getopts::usage("", &opts));
+        println!("{}", opts.usage(""));
         println!("Delete FILE(s) if --remove (-u) is specified.  The default is not to remove");
         println!("the files because it is common to operate on device files like /dev/hda,");
         println!("and those files usually should not be removed.");
@@ -252,12 +274,12 @@ pub fn main() {
             None => 3us
         };
         let remove = matches.opt_present("remove");
-        let size = get_size(matches.opt_str("size"), prog_name.as_slice());
+        let size = get_size(matches.opt_str("size"), &prog_name);
         let exact = matches.opt_present("exact") && size.is_none(); // if -s is given, ignore -x
         let zero = matches.opt_present("zero");
         let verbose = matches.opt_present("verbose");
         for path_str in matches.free.into_iter() {
-            wipe_file(path_str.as_slice(), iterations, prog_name.as_slice(),
+            wipe_file(&path_str, iterations, &prog_name,
                       remove, size, exact, zero, verbose);
         }
     }
@@ -272,15 +294,40 @@ fn wait_enter() {
 }
 */
 
+trait FilenameStr {
+    fn filename_str(&self) -> String;
+}
+
+impl FilenameStr for path::Path {
+    fn filename_str(&self) -> String {
+        let s = match self.file_name() {
+            Some(os_str) => os_str.to_str().unwrap_or(""),
+            None => ""
+        };
+
+        String::from(s)
+    }
+}
+
+impl FilenameStr for fs::File {
+    fn filename_str(&self) -> String {
+        match self.path() {
+            Some(p) => p.filename_str(),
+            None => String::from("")
+        }
+    }
+}
+
 fn bytes_to_string(bytes: &[u8]) -> String {
     let mut s = String::new();
     while s.len() < 6 {
         for byte in bytes.iter() {
-            s.push_str(format!("{:02x}", *byte).as_slice());
+            s.push_str(&format!("{:02x}", *byte));
             if s.len() == 6 { break; }
         }
     }
-    return s;
+
+    s
 }
 
 fn wipe_file(path_str: &str, n_passes: usize, prog_name: &str,
@@ -288,14 +335,14 @@ fn wipe_file(path_str: &str, n_passes: usize, prog_name: &str,
 
     // Get these potential errors out of the way first
     let path = Path::new(path_str);
-    if !path.exists() { eprintln!("{}: {}: No such file or directory", prog_name, path.filname_display()); return; }
-    if !path.is_file() { eprintln!("{}: {}: Not a file", prog_name, path.filname_display()); return; }
+    if !path.exists() { eprintln!("{}: {}: No such file or directory", prog_name, path.filename_str()); return; }
+    if !path.is_file() { eprintln!("{}: {}: Not a file", prog_name, path.filename_str()); return; }
     
-    let mut file = match fs::File::open_mode(&path, old_io::Open, old_io::Write) {
+    let mut file = match fs::OpenOptions::new().write(true).open(&path) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("{}: {}: Couldn't open file for writing: {}", prog_name,
-                                                                    path.filname_display(), e.desc);
+            eprintln!("{}: {:?}: Couldn't open file for writing: {}", prog_name,
+                                                                    path.file_name(), e);
             return;
         }
     };
@@ -320,7 +367,7 @@ fn wipe_file(path_str: &str, n_passes: usize, prog_name: &str,
         for i in 0..remainder {
             pass_sequence.push(PassType::Pattern(PATTERNS[i]));
         }
-        rand::thread_rng().shuffle(pass_sequence.as_mut_slice()); // randomize the order of application
+        rand::thread_rng().shuffle(&mut pass_sequence); // randomize the order of application
         
         let n_random = 3us + n_passes/10us; // Minimum 3 random passes; ratio of 10 after
         // Evenly space random passes; ensures one at the beginning and end
@@ -336,10 +383,10 @@ fn wipe_file(path_str: &str, n_passes: usize, prog_name: &str,
     for (i, pass_type) in pass_sequence.iter().enumerate() {
         if verbose {
             if total_passes.to_string().len() == 1 {
-                print!("{}: {}: pass {}/{} ", prog_name, path.filname_display(), i+1, total_passes);
+                print!("{}: {}: pass {}/{} ", prog_name, path.filename_str(), i+1, total_passes);
             }
             else {
-                print!("{}: {}: pass {:2.0}/{:2.0} ", prog_name, path.filname_display(), i+1, total_passes);
+                print!("{}: {}: pass {:2.0}/{:2.0} ", prog_name, path.filename_str(), i+1, total_passes);
             }
             match *pass_type {
                 PassType::Random => println!("(random)"),
@@ -348,14 +395,15 @@ fn wipe_file(path_str: &str, n_passes: usize, prog_name: &str,
         }
         // size is an optional argument for exactly how many bytes we want to shred
         do_pass(&mut file, *pass_type, size, exact, prog_name); // Ignore failed writes; just keep trying
-        file.fsync(); // Sync data & metadata to disk after each pass just in case
-        file.seek(0, old_io::SeekStyle::SeekSet);
+        file.sync_all(); // Sync data & metadata to disk after each pass just in case
+        file.seek(io::SeekFrom::Start(0));
     }
     
     if remove {
-        let renamed_path: Option<PathBuf> = wipe_name(&path, prog_name, true);
+        println!("{}: {}: removing", prog_name, path.filename_str());
+        let renamed_path: Option<PathBuf> = wipe_name(&path, prog_name, verbose);
         match renamed_path {
-            Some(rp) => { remove_file(&rp, path.filename_str().unwrap_or(""), prog_name, verbose); }
+            Some(rp) => { remove_file(&rp, &path.filename_str(), prog_name, verbose); }
             None => (),
         }
     }
@@ -368,8 +416,8 @@ fn do_pass(file: &mut fs::File, generator_type: PassType,
         Ok(metadata) => metadata.len(),
         Err(e) => {
                 eprintln!("{}: {}: Couldn't stat file: {}", prog_name,
-                                                            file.path().filname_display(),
-                                                            e.desc);
+                                                            file.filename_str(),
+                                                            e.description());
                 return Err(());
             }
     };
@@ -385,8 +433,8 @@ fn do_pass(file: &mut fs::File, generator_type: PassType,
             Ok(_) => (),
             Err(e) => {
                 eprintln!("{}: {}: Couldn't write to file: {}", prog_name,
-                                                                file.path().filname_display(),
-                                                                e.desc);
+                                                                file.filename_str(),
+                                                                e.description());
                 return Err(());
             }
         }
@@ -397,49 +445,53 @@ fn do_pass(file: &mut fs::File, generator_type: PassType,
 // Repeatedly renames the file with strings of decreasing length (most likely all 0s)
 // Return the path of the file after its last renaming or None if error
 fn wipe_name(file_path: &Path, prog_name: &str, verbose: bool) -> Option<PathBuf> {
-    let basename_len: usize = format!("{}", file_path.filname_display()).len();
-    let mut prev_path = file_path.clone();
-    let dir_path: Path = file_path.dir_path();
+    let basename_len: usize = file_path.filename_str().len();
+    let dir_path = match file_path.parent() {
+        Some(p)             => if p.as_os_str().to_string_lossy().len() == 0 {
+                                   Path::new(".") // If it's "" then it's the current dir
+                               }
+                               else {p},
+        None                => Path::new("/")
+    };
     
     // make a fs::File for the containing directory so we can call fsync() after every rename
-    let mut dir_file = match fs::File::open_mode(&dir_path, old_io::Open, old_io::Read) {
+    let mut dir_file = match fs::OpenOptions::new().read(true).open(&dir_path) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("{}: {}: Couldn't open directory as read-only", prog_name,
-                                                                      dir_path.filname_display());
+                                                                      dir_path.filename_str());
             return None;
         }
     };
     
-    let mut last_path: Path = Path::new(""); // for use inside the loop;
+    let mut last_path = file_path.to_path_buf();
     
     for length in (1..basename_len+1).rev() {
         for name in FilenameGenerator::new(length) {
-            let new_path = dir_path.join(name.as_slice());
+            let new_path = dir_path.join(&name);
             match new_path.metadata() {
                 Err(_) => (), // Good. We don't want the filename to already exist (don't overwrite)
                 Ok(_) => continue, // If it does, find another name that doesn't
             }
-            match fs::rename(&prev_path, &new_path) {
+            match fs::rename(&last_path, &new_path) {
                 Ok(()) => {
                     if verbose {
                         println!("{}: {}: renamed to {}", prog_name,
-                                                          prev_path.filname_display(),
-                                                          new_path.filname_display());
+                                                          &last_path.filename_str(),
+                                                          new_path.filename_str());
                     }
                     // Sync this change to disk immediately; Note: this is equivalent to the
                     // --remove=wipesync option in coreutils' shred. Here, it is the only option
-                    dir_file.fsync();
+                    dir_file.sync_all();
                     
-                    last_path = &new_path.clone();
-                    prev_path = &new_path;
+                    last_path = new_path.clone();
                     break;
                 }
                 Err(e) => {
                     eprintln!("{}: {}: Couldn't rename to {}: {}", prog_name,
-                                                                   prev_path.filname_display(),
-                                                                   new_path.filname_display(),
-                                                                   e.desc);
+                                                                   &last_path.filename_str(),
+                                                                   new_path.filename_str(),
+                                                                   e.description());
                     return None;
                 }
             }
@@ -455,7 +507,7 @@ fn remove_file(path: &Path, orig_filename: &str, prog_name: &str, verbose: bool)
             Ok(())
         }
         Err(e) => {
-            eprintln!("{}: {}: Couldn't remove {}", prog_name, path.filname_display(), e.desc);
+            eprintln!("{}: {}: Couldn't remove {}", prog_name, path.filename_str(), e.description());
             Err(())
         }
     }
