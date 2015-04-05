@@ -27,7 +27,7 @@ use std::cell::{Cell, RefCell};
 use std::env;
 use std::fs;
 use std::io::Seek;
-use std::io::Write;
+use std::io::{Write, BufWriter};
 use std::fs::PathExt;
 use std::path;
 use std::path::{Path, PathBuf};
@@ -427,19 +427,22 @@ fn do_pass(file: &mut fs::File, generator_type: PassType,
         Some(given) => BytesGenerator::new(given, generator_type, exact),
         None        => BytesGenerator::new(real_file_size, generator_type, exact),
     };
+
+    let filename_str = file.filename_str();
+    let mut buf_writer = BufWriter::new(file);
     
     for block in generator {
-        match file.write_all(&*block) {
+        match buf_writer.write_all(&*block) {
             Ok(_) => (),
             Err(e) => {
                 eprintln!("{}: {}: Couldn't write to file: {}", prog_name,
-                                                                file.filename_str(),
+                                                                filename_str,
                                                                 e.description());
                 return Err(());
             }
         }
     }
-    return Ok(());
+    Ok(())
 }
 
 // Repeatedly renames the file with strings of decreasing length (most likely all 0s)
@@ -447,11 +450,11 @@ fn do_pass(file: &mut fs::File, generator_type: PassType,
 fn wipe_name(file_path: &Path, prog_name: &str, verbose: bool) -> Option<PathBuf> {
     let basename_len: usize = file_path.filename_str().len();
     let dir_path = match file_path.parent() {
-        Some(p)             => if p.as_os_str().to_string_lossy().len() == 0 {
-                                   Path::new(".") // If it's "" then it's the current dir
-                               }
-                               else {p},
-        None                => Path::new("/")
+        Some(p) => if p.as_os_str().to_string_lossy().len() == 0 {
+                      Path::new(".") // If it's "" then it's the current dir
+                   }
+                   else {p},
+           None => Path::new("/")
     };
     
     // make a fs::File for the containing directory so we can call fsync() after every rename
@@ -497,7 +500,7 @@ fn wipe_name(file_path: &Path, prog_name: &str, verbose: bool) -> Option<PathBuf
             }
         } // If every possible filename already exists, just reduce the length and try again
     }
-    return Some(last_path.to_path_buf());
+    Some(last_path.to_path_buf())
 }
 
 fn remove_file(path: &Path, orig_filename: &str, prog_name: &str, verbose: bool) -> Result<(), ()> {
