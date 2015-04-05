@@ -1,0 +1,18 @@
+[package]
+
+name = "shred"
+version = "1.0.0"
+authors = ["Michael Rosenberg <42micro@gmail.com>"]
+
+[[bin]]
+name = "shred"
+version = "1.0.0"
+path = "shred.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+
+[dependencies]
+getopts = "0.2.9"
+rand    = "0.3.7"
