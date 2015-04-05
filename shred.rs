@@ -13,8 +13,10 @@
 /*
  TODO:
      * MAKE FASTER
+     * Use direct IO
      * handle all errors
      * make own error types for cleaner code
+     * support non-regular files like char or block devices
      * concurrency(?)
 */
 
