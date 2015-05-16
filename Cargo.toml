@@ -1,12 +1,11 @@
 [package]
 
 name = "shred"
-version = "1.0.0"
+version = "1.1.0"
 authors = ["Michael Rosenberg <42micro@gmail.com>"]
 
 [[bin]]
 name = "shred"
-version = "1.0.0"
 path = "shred.rs"
 
 [profile.release]
