@@ -83,7 +83,7 @@ struct ShredLogger {
 impl ShredLogger {
     fn new(prog_name: &str, verbose: bool) -> ShredLogger {
         ShredLogger { prog_name: prog_name.to_string(),
-                      filename: RefCell::new(String::from("")),
+                      filename: RefCell::new(String::new()),
                       verbose: verbose }
     }
 
@@ -113,17 +113,17 @@ impl ShredLogger {
 
     fn print_shred_error(&self, err: ShredError) {
         use self::ShredError::*;
-        match err {
-            NoSuchFile           => self.print_file_err("No such file or directory"),
-            NotAFile             => self.print_file_err("Not a regular file"),
-            NameExhaustion       => self.print_file_err("Exhausted nameset for renaming"),
-            OpenErr(desc)        => self.print_file_err(&format!("Couldn't open file: {}", desc)),
-            RemoveErr(desc)      => self.print_file_err(&format!("Couldn't remove: {}", desc)),
-            StatErr(desc)        => self.print_file_err(&format!("Couldn't stat file: {}", desc)),
-            WriteErr(desc)       => self.print_file_err(&format!("Couldn't write to file: {}", desc)),
-            FsyncErr(path, desc) => self.print_file_err(&format!("Couldn't fsync {}: {}", path, desc)),
-            RenameErr(to, desc)  => self.print_file_err(&format!("Couldn't rename to {}: {}", to, desc)),
-        }
+        self.print_file_err(match err {
+            NoSuchFile           => "No such file or directory".to_string(),
+            NotAFile             => "Not a regular file".to_string(),
+            NameExhaustion       => "Exhausted nameset for renaming".to_string(),
+            OpenErr(desc)        => format!("Couldn't open file: {}", desc),
+            RemoveErr(desc)      => format!("Couldn't remove: {}", desc),
+            StatErr(desc)        => format!("Couldn't stat file: {}", desc),
+            WriteErr(desc)       => format!("Couldn't write to file: {}", desc),
+            FsyncErr(path, desc) => format!("Couldn't fsync {}: {}", path, desc),
+            RenameErr(to, desc)  => format!("Couldn't rename to {}: {}", to, desc)
+        }.as_ref());
     }
 }
 
@@ -150,13 +150,14 @@ impl ParentStr for path::Path {
     fn parent_str(&self) -> String {
         let s = match self.parent() {
             Some(path) => path.filename_str(),
-            None => String::from("")
+            None => String::new() // Empty string
         };
         
         s
     }
 }
 
+// Output is encoded as lowercase hex
 fn bytes_to_string(bytes: &[u8]) -> String {
     let mut s = String::new();
     while s.len() < 6 {
@@ -295,6 +296,7 @@ impl<'a> Iterator for BytesGenerator<'a> {
     }
 }
 
+// Stolen and tweaked from ../du/du.rs by Joseph Crail. Thanks!
 fn get_size(size_str_opt: Option<String>, logger: &ShredLogger) -> Option<u64> {
     if size_str_opt.is_none() { return None; }
     
@@ -347,13 +349,10 @@ pub fn main() {
     opts.optflag("", "version", "output version information and exit");
     
     // Vec::tail() is unstable; use [1..] instead
-    let matches = match opts.parse(args[1..].iter()) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("{}: {}", prog_name, e);
-            exit!(1);
-        }
-    };
+    let matches = opts.parse(args[1..].iter()).unwrap_or_else(|e| {
+        eprintln!("{}: {}", prog_name, e);
+        exit!(1);
+    });
 
     if matches.opt_present("help") {
         println!("Usage: {} [OPTION]... FILE...", prog_name);
@@ -374,13 +373,10 @@ pub fn main() {
         exit!(0);
     } else {
         let iterations: usize = match matches.opt_str("iterations") {
-            Some(s) => match s.parse::<usize>() {
-                           Ok(u) => u,
-                           Err(_) => {
-                               eprintln!("{}: Invalid number of passes", prog_name);
-                               exit!(1);
-                           }
-                       },
+            Some(s) => s.parse::<usize>().unwrap_or_else(|_| {
+                           eprintln!("{}: Invalid number of passes", prog_name);
+                           exit!(1);
+                       }),
             None => 3
         };
 
@@ -396,10 +392,9 @@ pub fn main() {
         for path_str in matches.free.into_iter() {
             let path = Path::new(&path_str);
             logger.set_filename(&path.filename_str());
-            match shred(path, iterations, remove, size, exact, zero, &logger) {
-                Err(se) => logger.print_shred_error(se),
-                _ => ()
-            }
+            let _ = shred(path, iterations, remove, size, exact, zero, &logger).map_err(|se|
+                logger.print_shred_error(se)
+            );
         }
     }
     
@@ -409,12 +404,12 @@ pub fn main() {
 fn shred(path: &Path, n_passes: usize, remove: bool,
          size: Option<u64>, exact: bool, zero: bool, logger: &ShredLogger) -> Result<(), ShredError> {
 
-    &try!(wipe_file(&path, n_passes, size, exact, zero, logger));
+    try!(wipe_file(&path, n_passes, size, exact, zero, logger));
 
     if remove {
         logger.print_file("removing");
-        let final_file_path =  &try! { wipe_name(&path, logger) };
-        try!(remove_file(final_file_path));
+        let final_file_path = try!(wipe_name(&path, logger));
+        try!(remove_file(&final_file_path));
         // path.filename_str() is the original filename (pre-wipe); use this when logging success
         logger.print_file_verbose("removed");
     }
@@ -429,10 +424,9 @@ fn wipe_file(path: &Path, n_passes: usize, size: Option<u64>,
     if !path.exists()  { return Err(ShredError::NoSuchFile); }
     if !path.is_file() { return Err(ShredError::NotAFile);   }
     
-    let mut file = match fs::OpenOptions::new().write(true).open(&path) {
-        Ok(f) => f,
-        Err(e) => return Err(ShredError::OpenErr(e.description().to_string()))
-    };
+    let mut file = try!(fs::OpenOptions::new().write(true).open(&path).map_err(|e|
+        ShredError::OpenErr(e.description().to_string()))
+    );
 
     // Fill up our pass sequence
     
@@ -468,33 +462,31 @@ fn wipe_file(path: &Path, n_passes: usize, size: Option<u64>,
     let total_passes = n_passes + { if zero { 1 } else { 0 } }; // shorthand here would be confusing
 
     for (i, pass_type) in pass_sequence.iter().enumerate() {
-        let mut log_str = if total_passes.to_string().len() == 1 {
+        let mut log_str = {
+            if total_passes.to_string().len() == 1 {
                 format!("pass {}/{} ", i+1, total_passes)
             } else {
                 format!("pass {:2.0}/{:2.0} ", i+1, total_passes)
-            };
-        match *pass_type {
-            PassType::Random => log_str.push_str("(random)"),
-            PassType::Pattern(p) => log_str.push_str(&format!("({})", bytes_to_string(p)))
+            }
         };
+        log_str.push_str(match *pass_type {
+            PassType::Random => "(random)".to_string(),
+            PassType::Pattern(p) => format!("({})", bytes_to_string(p))
+        }.as_ref());
         logger.print_file_verbose(&log_str);
 
         // size is an optional argument for exactly how many bytes we want to shred
         // Do not fail if writes, stats, or syncs fail; just notify the user and keep going
-        match do_pass(&mut file, *pass_type, size, exact) {
-            Ok(_) => (),
-            Err(se) => logger.print_shred_error(se)
-        }
+        let _ = do_pass(&mut file, *pass_type, size, exact).map_err(|se|
+            logger.print_shred_error(se)
+        );
 
-        match file.sync_all() { // Sync data & metadata to disk after each pass just in case
-            Ok(_) => (),
-            Err(e) => {
-                let se = ShredError::FsyncErr(format!("{}/", path.parent_str()),
-                                              e.description().to_string());
-                logger.print_shred_error(se);
-            }
-        }
-        let _ = file.seek(io::SeekFrom::Start(0));
+        let _ = file.sync_all().map_err(|e| { // Sync data & metadata to disk after each pass just in case
+            let se = ShredError::FsyncErr(format!("{}/", path.parent_str()),
+                                          e.description().to_string());
+            logger.print_shred_error(se);
+        });
+        let _ = file.seek(io::SeekFrom::Start(0)); // This can't fail. Seeking to 0 is always possible
     }
 
     Ok(())
@@ -503,10 +495,10 @@ fn wipe_file(path: &Path, n_passes: usize, size: Option<u64>,
 fn do_pass(file: &mut fs::File, generator_type: PassType,
            given_file_size: Option<u64>, exact: bool) -> Result<(), ShredError> {
            
-    let real_file_size = match file.metadata() {
-        Ok(m)  => m.len(),
-        Err(e) => return Err(ShredError::StatErr(e.description().to_string()))
-    };
+    let real_file_size = try!(file.metadata()
+                              .map(|m| m.len())
+                              .map_err(|e| ShredError::StatErr(e.description().to_string()))
+                             );
     
     // Recall --size specifies how many bytes we want to shred
     let generator = match given_file_size {
@@ -517,10 +509,9 @@ fn do_pass(file: &mut fs::File, generator_type: PassType,
     let mut buf_writer = BufWriter::new(file);
     
     for block in generator {
-        match buf_writer.write_all(&*block) {
-            Ok(_) => (),
-            Err(e) => return Err(ShredError::WriteErr(e.description().to_string()))
-        }
+        try!(buf_writer.write_all(&*block)
+                       .map_err(|e|ShredError::WriteErr(e.description().to_string()))
+        );
     }
 
     Ok(())
@@ -539,10 +530,9 @@ fn wipe_name(file_path: &Path, logger: &ShredLogger) -> Result<PathBuf, ShredErr
     };
     
     // make a fs::File for the containing directory so we can call fsync() after every rename
-    let dir_file = match fs::OpenOptions::new().read(true).open(&dir_path) {
-        Ok(f)  => f,
-        Err(e) => return Err(ShredError::OpenErr(e.description().to_string()))
-    };
+    let dir_file = try!(fs::OpenOptions::new().read(true).open(&dir_path)
+                            .map_err(|e| ShredError::OpenErr(e.description().to_string()))
+                       );
     
     let mut last_path = file_path.to_path_buf();
     
@@ -556,14 +546,11 @@ fn wipe_name(file_path: &Path, logger: &ShredLogger) -> Result<PathBuf, ShredErr
         }
         // Sync this change to disk immediately; Note: this is equivalent to the
         // --remove=wipesync option in coreutils' shred. Here, it is the only option
-        match dir_file.sync_all() {
-            Ok(_) => (),
-            Err(e) => {
-                let se = ShredError::FsyncErr(format!("{}/", file_path.parent_str()),
-                                              e.description().to_string());
-                logger.print_shred_error(se);
-            }
-        }
+        let _ = dir_file.sync_all().map_err(|e| {
+            let se = ShredError::FsyncErr(format!("{}/", file_path.parent_str()),
+                                          e.description().to_string());
+            logger.print_shred_error(se);
+        });
     }
 
     Ok(last_path)
@@ -572,12 +559,13 @@ fn wipe_name(file_path: &Path, logger: &ShredLogger) -> Result<PathBuf, ShredErr
 fn name_pass(new_name_len: usize, file_path: &Path, dir_path: &Path) -> Result<PathBuf, ShredError> {
     for name in FilenameGenerator::new(new_name_len) {
         let new_path = dir_path.join(&name);
-        match new_path.metadata() {
-            Err(_) => (), // Good. We don't want the filename to already exist (don't overwrite)
-            Ok(_) => continue, // If it does, find another name that doesn't
-        }
+
+        // We don't want the filename to already exist (don't overwrite)
+        // If it does, find another name that doesn't
+        if new_path.exists() { continue }
+
         match fs::rename(&file_path, &new_path) {
-            Ok(()) => return Ok(new_path),
+            Ok(_) => return Ok(new_path),
             Err(e) => return Err(ShredError::RenameErr(new_path.filename_str(),
                                                        e.description().to_string()))
         }
@@ -587,8 +575,7 @@ fn name_pass(new_name_len: usize, file_path: &Path, dir_path: &Path) -> Result<P
 }
 
 fn remove_file(path: &Path) -> Result<(), ShredError> {
-    match fs::remove_file(path) {
-        Ok(_) => Ok(()),
-        Err(e) => Err(ShredError::RemoveErr(e.description().to_string()))
-    }
+    fs::remove_file(path)
+        .map(|_| ())
+        .map_err(|e| ShredError::RemoveErr(e.description().to_string()))
 }
