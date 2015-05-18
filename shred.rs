@@ -30,6 +30,8 @@ use std::fs;
 use std::io::Seek;
 use std::io::{Write, BufWriter};
 use std::fs::PathExt;
+use std::fmt;
+use std::fmt::Display;
 use std::path;
 use std::path::{Path, PathBuf};
 use std::io;
@@ -73,6 +75,23 @@ enum ShredError {
     RenameErr(String, String), // (rename_to, desc)
 }
 
+impl fmt::Display for ShredError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        use ShredError::*;
+        f.write_str(match *self {
+            NoSuchFile                   => "No such file or directory".to_string(),
+            NotAFile                     => "Not a regular file".to_string(),
+            NameExhaustion               => "Exhausted nameset for renaming".to_string(),
+            OpenErr(ref desc)            => format!("Couldn't open file: {}", desc),
+            RemoveErr(ref desc)          => format!("Couldn't remove: {}", desc),
+            StatErr(ref desc)            => format!("Couldn't stat file: {}", desc),
+            WriteErr(ref desc)           => format!("Couldn't write to file: {}", desc),
+            FsyncErr(ref path, ref desc) => format!("Couldn't fsync {}: {}", path, desc),
+            RenameErr(ref to, ref desc)  => format!("Couldn't rename to {}: {}", to, desc)
+        }.as_ref())
+    }
+}
+
 // Used for verbose and error output
 struct ShredLogger {
     prog_name: String,
@@ -93,37 +112,26 @@ impl ShredLogger {
         f.push_str(filename);
     }
 
-    fn print_err(&self, err_str: &str) {
-        eprintln!("{}: {}", self.prog_name, err_str);
+    fn print_err<T: Display>(&self, err: T) {
+        eprintln!("{}: {}", self.prog_name, err);
     }
 
-    fn print_file_err(&self, err_str: &str) {
-        self.print_err(&format!("{}: {}", *self.filename.borrow(), err_str));
+    fn print_file_err<T: Display>(&self, err: T) {
+        self.print_err(format!("{}: {}", *self.filename.borrow(), err));
     }
 
-    fn print_file(&self, s: &str) {
-        println!("{}: {}: {}", self.prog_name, *self.filename.borrow(), s);
+    fn print_file<T: Display>(&self, d: T) {
+        println!("{}: {}: {}", self.prog_name, *self.filename.borrow(), d);
     }
 
-    fn print_file_verbose(&self, v_str: &str) {
+    fn print_file_verbose<T: Display>(&self, d: T) {
         if self.verbose {
-            self.print_file(v_str);
+            self.print_file(d);
         }
     }
 
     fn print_shred_error(&self, err: ShredError) {
-        use self::ShredError::*;
-        self.print_file_err(match err {
-            NoSuchFile           => "No such file or directory".to_string(),
-            NotAFile             => "Not a regular file".to_string(),
-            NameExhaustion       => "Exhausted nameset for renaming".to_string(),
-            OpenErr(desc)        => format!("Couldn't open file: {}", desc),
-            RemoveErr(desc)      => format!("Couldn't remove: {}", desc),
-            StatErr(desc)        => format!("Couldn't stat file: {}", desc),
-            WriteErr(desc)       => format!("Couldn't write to file: {}", desc),
-            FsyncErr(path, desc) => format!("Couldn't fsync {}: {}", path, desc),
-            RenameErr(to, desc)  => format!("Couldn't rename to {}: {}", to, desc)
-        }.as_ref());
+        self.print_file_err(format!("{}", err));
     }
 }
 
