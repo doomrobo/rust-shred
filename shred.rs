@@ -1,5 +1,4 @@
 #![crate_name = "shred"]
-#![feature(path_ext)]
 /*
  * This file is part of the uutils coreutils package.
  *
@@ -13,7 +12,7 @@
 /*
  TODO:
      * MAKE FASTER
-     * Use direct IO
+     * Use direct IO(?)
      * handle all errors
      * support non-regular files like char or block devices
      * concurrency(?)
@@ -29,7 +28,6 @@ use std::env;
 use std::fs;
 use std::io::Seek;
 use std::io::{Write, BufWriter};
-use std::fs::PathExt;
 use std::fmt;
 use std::fmt::Display;
 use std::path;
@@ -429,8 +427,13 @@ fn wipe_file(path: &Path, n_passes: usize, size: Option<u64>,
              exact: bool, zero: bool, logger: &ShredLogger) -> Result<(), ShredError> {
 
     // Get these potential errors out of the way first
-    if !path.exists()  { return Err(ShredError::NoSuchFile); }
-    if !path.is_file() { return Err(ShredError::NotAFile);   }
+    let metadata = fs::metadata(path);
+    match metadata {
+        // Path doesn't exist
+        Err(_) => return Err(ShredError::NoSuchFile),
+        // Path exists but isn't a file
+        Ok(m)  => if !m.is_file() { return Err(ShredError::NotAFile); },
+    }
     
     let mut file = try!(fs::OpenOptions::new().write(true).open(&path).map_err(|e|
         ShredError::OpenErr(e.description().to_string()))
@@ -568,9 +571,9 @@ fn name_pass(new_name_len: usize, file_path: &Path, dir_path: &Path) -> Result<P
     for name in FilenameGenerator::new(new_name_len) {
         let new_path = dir_path.join(&name);
 
-        // We don't want the filename to already exist (don't overwrite)
-        // If it does, find another name that doesn't
-        if new_path.exists() { continue }
+        // Check if the new path already exists. If it's already
+        // taken, move along
+        if fs::metadata(&new_path).is_ok() { continue }
 
         match fs::rename(&file_path, &new_path) {
             Ok(_) => return Ok(new_path),
