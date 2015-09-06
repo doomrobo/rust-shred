@@ -12,13 +12,15 @@
 /*
  TODO:
      * MAKE FASTER
+     * Add recursive shredding
+     * Add --iterations=X as a synonym for -n X
+     * Add - for output to stdout
      * Use direct IO(?)
-     * handle all errors
-     * support non-regular files like char or block devices
      * concurrency(?)
 */
 
 extern crate getopts;
+extern crate libc;
 
 extern crate rand;
 use rand::{ThreadRng, Rng};
@@ -26,6 +28,7 @@ use rand::{ThreadRng, Rng};
 use std::cell::{Cell, RefCell};
 use std::env;
 use std::fs;
+use std::fs::File;
 use std::io::Seek;
 use std::io::{Write, BufWriter};
 use std::fmt;
@@ -42,10 +45,12 @@ mod util;
 
 static NAME: &'static str = "shred";
 static VERSION_STR: &'static str = env!("CARGO_PKG_VERSION");
-const BLOCK_SIZE: usize = 512;
+const DEFAULT_BLOCK_SIZE: usize = 4096;
+
+// Allowed filename characters
 const NAMESET: &'static str = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_.";
 
-// Patterns as shown in the GNU coreutils shred implementation
+// Patterns as in the GNU coreutils shred implementation
 const PATTERNS: [&'static [u8]; 22] = [
     b"\x00", b"\xFF",
     b"\x55", b"\xAA",
@@ -62,29 +67,29 @@ enum PassType<'a> {
 }
 
 enum ShredError {
-    NoSuchFile,
-    NotAFile,
     NameExhaustion,
+    Unsupported(String),
     OpenErr(String),
     RemoveErr(String),
     StatErr(String),
     WriteErr(String),
-    FsyncErr(String, String),  // (path, desc)
+    FsyncErr(String),
+    SeekErr(String),
     RenameErr(String, String), // (rename_to, desc)
 }
 
-impl fmt::Display for ShredError {
+impl Display for ShredError {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         use ShredError::*;
         f.write_str(match *self {
-            NoSuchFile                   => "No such file or directory".to_string(),
-            NotAFile                     => "Not a regular file".to_string(),
             NameExhaustion               => "Exhausted nameset for renaming".to_string(),
+            Unsupported(ref file_type)   => format!("Unsupported file type: {}", file_type),
             OpenErr(ref desc)            => format!("Couldn't open file: {}", desc),
-            RemoveErr(ref desc)          => format!("Couldn't remove: {}", desc),
+            RemoveErr(ref desc)          => format!("Couldn't remove file: {}", desc),
             StatErr(ref desc)            => format!("Couldn't stat file: {}", desc),
             WriteErr(ref desc)           => format!("Couldn't write to file: {}", desc),
-            FsyncErr(ref path, ref desc) => format!("Couldn't fsync {}: {}", path, desc),
+            FsyncErr(ref desc)           => format!("Couldn't fsync file: {}", desc),
+            SeekErr(ref desc)            => format!("Couldn't seek file to 0: {}", desc),
             RenameErr(ref to, ref desc)  => format!("Couldn't rename to {}: {}", to, desc)
         }.as_ref())
     }
@@ -158,7 +163,7 @@ impl ParentStr for path::Path {
             Some(path) => path.filename_str(),
             None => String::new() // Empty string
         };
-        
+
         s
     }
 }
@@ -189,28 +194,28 @@ impl FilenameGenerator {
         for _ in 0..name_len {
             indices.push(0);
         }
-        FilenameGenerator{name_len: name_len,
-                          nameset_indices: RefCell::new(indices),
-                          exhausted: Cell::new(false)}
+        FilenameGenerator { name_len: name_len,
+                            nameset_indices: RefCell::new(indices),
+                            exhausted: Cell::new(false) }
     }
 }
 
 impl Iterator for FilenameGenerator {
     type Item = String;
-    
+
     fn next(&mut self) -> Option<String> {
         if self.exhausted.get() {
             return None;
         }
-        
+
         let mut nameset_indices = self.nameset_indices.borrow_mut();
-        
+
         // Make the return value, then increment
         let mut ret = String::new();
         for i in nameset_indices.iter() {
             ret.push(NAMESET.chars().nth(*i).unwrap());
         }
-        
+
         if nameset_indices[0] == NAMESET.len()-1 { self.exhausted.set(true) }
         // Now increment the least significant index
         for i in (0..self.name_len).rev() {
@@ -223,15 +228,15 @@ impl Iterator for FilenameGenerator {
                 break;
             }
         }
-        
+
         Some(ret)
     }
 }
 
-// Used to generate blocks of bytes of size <= BLOCK_SIZE based on either a give pattern
+// Used to generate blocks of bytes of size <= DEFAULT_BLOCK_SIZE based on either a give pattern
 // or randomness
 struct BytesGenerator<'a> {
-    total_bytes: u64,
+    total_bytes: Option<u64>,
     bytes_generated: Cell<u64>,
     block_size: usize,
     exact: bool, // if false, every block's size is block_size
@@ -240,41 +245,47 @@ struct BytesGenerator<'a> {
 }
 
 impl<'a> BytesGenerator<'a> {
-    fn new(total_bytes: u64, gen_type: PassType<'a>, exact: bool) -> BytesGenerator {
+    // total_bytes is optional; if None is provided, this iterator will not terminate; a for loop
+    // using this will only stop when it errors and returns
+    fn new(total_bytes: Option<u64>, block_size: usize,
+           gen_type: PassType<'a>, exact: bool) -> BytesGenerator {
         let rng = match gen_type {
             PassType::Random => Some(RefCell::new(rand::thread_rng())),
             _ => None,
         };
-        
-        let gen = BytesGenerator{total_bytes: total_bytes,
-                                 bytes_generated: Cell::new(0u64),
-                                 block_size: BLOCK_SIZE,
-                                 exact: exact,
-                                 gen_type: gen_type,
-                                 rng: rng};
-        gen
+
+        BytesGenerator { total_bytes: total_bytes,
+                         bytes_generated: Cell::new(0u64),
+                         block_size: block_size,
+                         exact: exact,
+                         gen_type: gen_type,
+                         rng: rng }
     }
 }
 
 impl<'a> Iterator for BytesGenerator<'a> {
     type Item = Box<[u8]>;
-    
+
     fn next(&mut self) -> Option<Box<[u8]>> {
         // We go over the total_bytes limit when !self.exact and total_bytes isn't a multiple
         // of self.block_size
-        if self.bytes_generated.get() >= self.total_bytes {
+        if self.total_bytes.is_some() && self.bytes_generated.get() >= self.total_bytes.unwrap() {
             return None;
         }
-        
+
         let this_block_size = {
-            let bytes_left = self.total_bytes - self.bytes_generated.get();
-            if !self.exact { self.block_size }
-            else if bytes_left >= self.block_size as u64 { self.block_size }
-            else { (bytes_left % self.block_size as u64) as usize }
+            // If no total size is given, then this generator is an infinite stream
+            if self.total_bytes.is_none() { self.block_size }
+            else {
+                let bytes_left = self.total_bytes.unwrap() - self.bytes_generated.get();
+                if !self.exact { self.block_size }
+                else if bytes_left >= self.block_size as u64 { self.block_size }
+                else { (bytes_left % self.block_size as u64) as usize }
+            }
         };
-        
+
         let mut bytes : Vec<u8> = Vec::with_capacity(this_block_size);
-        
+
         match self.gen_type {
             PassType::Random => {
                 let mut rng = self.rng.as_ref().unwrap().borrow_mut();
@@ -295,17 +306,124 @@ impl<'a> Iterator for BytesGenerator<'a> {
                 }
             }
         };
-        
+
         let new_bytes_generated = self.bytes_generated.get() + this_block_size as u64;
         self.bytes_generated.set(new_bytes_generated);
         Some(bytes.into_boxed_slice())
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum FileType {
+    RegFile,
+    Dir,
+    Symlink,
+    BlockDev,
+    CharDev,
+    Tty,       // I know this isn't a separate file mode, but we distinguish TTYs because they are
+               // not shreddable (they can't seek)
+    Fifo,
+    Socket,
+    Unknown
+}
+
+impl Display for FileType {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        use FileType::*;
+        f.write_str(match *self {
+            RegFile  => "Regular file",
+            Dir      => "Directory",
+            Symlink  => "Symlink",
+            BlockDev => "Block device",
+            CharDev  => "Character device",
+            Tty      => "TTY",
+            Fifo     => "FIFO",
+            Socket   => "Socket",
+            Unknown  => "Unknown"
+        })
+    }
+}
+
+struct ShredMetadata {
+    file_type: FileType, // Not really necessary; size and block_size are enough
+    size: u64,
+    block_size: usize // Only really important for block devices
+}
+
+// We cannot handle char or block devices; error if it's one of those
+#[cfg(not(unix))]
+fn get_metadata(file: &File) -> Result<ShredMetadata, ShredError> {
+    let fs_metadata = match file.metadata() {
+        Err(e) => return Err(ShredError::StatErr(format!("{}", e))),
+        Ok(m)  => m
+    };
+    let fs_file_type = fs_metadata.file_type();
+    let file_type = match (fs_file_type.is_file(), fs_file_type.is_dir(), fs_file_type.is_symlink()) {
+        (true, _, _) => FileType::RegFile,
+        (_, true, _) => FileType::Dir,
+        (_, _, true) => FileType::Symlink,
+        (_, _, _)    => FileType::Unknown
+    };
+    if file_type != FileType::RegFile {
+        return Err(ShredError::Unsupported(format!("{}", file_type)));
+    }
+
+    let size = fs_metadata.len() as u64;
+    let block_size = DEFAULT_BLOCK_SIZE;
+
+    Ok(ShredMetadata { file_type: file_type, size: size, block_size: block_size })
+}
+
+// We can handle block devices and non-tty char devices
+#[cfg(unix)]
+fn get_metadata(file: &File) -> Result<ShredMetadata, ShredError> {
+    use libc::consts::os::posix88::*;
+    use libc::funcs::posix88::unistd::isatty;
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::io::AsRawFd;
+
+    let fd = file.as_raw_fd();
+    let is_tty = unsafe { isatty(fd) };
+
+    let fs_metadata = match file.metadata() {
+        Err(e) => return Err(ShredError::StatErr(format!("{}", e))),
+        Ok(m)  => m
+    };
+    let file_type = match fs_metadata.mode() & S_IFMT {
+        S_IFREG  => FileType::RegFile,
+        S_IFDIR  => FileType::Dir,
+        S_IFLNK  => FileType::Symlink,
+        S_IFBLK  => FileType::BlockDev,
+        // I know this isn't a separate file mode, but we distinguish TTYs because they are not
+        // shreddable (they can't seek)
+        S_IFCHR  => if is_tty == 1 { FileType::Tty } else { FileType::CharDev },
+        S_IFIFO  => FileType::Fifo,
+        S_IFSOCK => FileType::Socket,
+        _        => FileType::Unknown
+    };
+    // As in the original shred, error on unshreddable files: TTYs, FIFOs, and sockets
+    match file_type {
+        FileType::Tty  |
+        FileType::Fifo |
+        FileType::Socket => return Err(ShredError::Unsupported(format!("{}", file_type))),
+        _                => ()
+    }
+
+    let size = fs_metadata.len() as u64;
+
+    // Use the devices perferred block size if possible; if it's 0 then use the default
+    let hw_block_size = fs_metadata.blksize() as usize;
+    let block_size = if file_type == FileType::BlockDev && hw_block_size != 0 { hw_block_size }
+                     else { DEFAULT_BLOCK_SIZE };
+
+    Ok(ShredMetadata { file_type: file_type, size: size, block_size: block_size })
+}
+
+
 // Stolen and tweaked from ../du/du.rs by Joseph Crail. Thanks!
 fn get_size(size_str_opt: Option<String>, logger: &ShredLogger) -> Option<u64> {
     if size_str_opt.is_none() { return None; }
-    
+
     let size_str = size_str_opt.as_ref().unwrap();
 
     let num_str = size_str.chars().take_while(|c| c.is_digit(10)).collect::<String>();
@@ -329,13 +447,13 @@ fn get_size(size_str_opt: Option<String>, logger: &ShredLogger) -> Option<u64> {
         "E" | "EiB" => 1024 * 1024 * 1024 * 1024 * 1024 * 1024,
         _ => 0
     };
-    
+
     let val = num_str.parse::<u64>().unwrap_or(0) * multiplier;
     if val == 0 {
         logger.print_err(&format!("{}: Invalid file size", &size_str));
         exit!(1);
     }
-    
+
     Some(val)
 }
 
@@ -353,7 +471,7 @@ pub fn main() {
     opts.optflag("z", "zero", "add a final overwrite with zeros to hide shredding");
     opts.optflag("", "help", "display this help and exit");
     opts.optflag("", "version", "output version information and exit");
-    
+
     // Vec::tail() is unstable; use [1..] instead
     let matches = opts.parse(args[1..].iter()).unwrap_or_else(|e| {
         eprintln!("{}: {}", prog_name, e);
@@ -403,7 +521,7 @@ pub fn main() {
             );
         }
     }
-    
+
     exit!(0);
 }
 
@@ -426,31 +544,26 @@ fn shred(path: &Path, n_passes: usize, remove: bool,
 fn wipe_file(path: &Path, n_passes: usize, size: Option<u64>,
              exact: bool, zero: bool, logger: &ShredLogger) -> Result<(), ShredError> {
 
-    // Get these potential errors out of the way first
-    let metadata = fs::metadata(path);
-    match metadata {
-        // Path doesn't exist
-        Err(_) => return Err(ShredError::NoSuchFile),
-        // Path exists but isn't a file
-        Ok(m)  => if !m.is_file() { return Err(ShredError::NotAFile); },
-    }
-    
     let mut file = try!(fs::OpenOptions::new().write(true).open(&path).map_err(|e|
-        ShredError::OpenErr(e.description().to_string()))
+        ShredError::OpenErr(format!("{}", e)))
     );
 
+    // Errors if the file type is not shreddable
+    let metadata = try!(get_metadata(&file));
+
     // Fill up our pass sequence
-    
+
     let mut pass_sequence: Vec<PassType> = Vec::new();
-    
-    if n_passes <= 3 { // Only random passes if n_passes <= 3
+
+    // Exclusively use random passes if n_passes <= 3
+    if n_passes <= 3 {
         for _ in 0..n_passes { pass_sequence.push(PassType::Random) }
     }
     // First fill it with Patterns, shuffle it, then evenly distribute Random
     else {
         let n_full_arrays = n_passes / PATTERNS.len(); // How many times can we go through all the patterns?
         let remainder = n_passes % PATTERNS.len(); // How many do we get through on our last time through?
-        
+
         for _ in 0..n_full_arrays {
             for p in PATTERNS.iter() {
                 pass_sequence.push(PassType::Pattern(*p));
@@ -460,21 +573,22 @@ fn wipe_file(path: &Path, n_passes: usize, size: Option<u64>,
             pass_sequence.push(PassType::Pattern(PATTERNS[i]));
         }
         rand::thread_rng().shuffle(&mut pass_sequence); // randomize the order of application
-        
+
         let n_random: usize = 3 + n_passes/10; // Minimum 3 random passes; ratio of 10 after
         // Evenly space random passes; ensures one at the beginning and end
         for i in 0..n_random {
             pass_sequence[i * (n_passes - 1)/(n_random - 1)] = PassType::Random;
         }
     }
-    
+
     // --zero specifies whether we want one final pass of 0x00 on our file
     if zero { pass_sequence.push(PassType::Pattern(b"\x00")); }
     let total_passes = n_passes + { if zero { 1 } else { 0 } }; // shorthand here would be confusing
 
     for (i, pass_type) in pass_sequence.iter().enumerate() {
+        // Set up the string that will be printed to the console in vebose mode
         let mut log_str = {
-            if total_passes.to_string().len() == 1 {
+            if total_passes < 10 {
                 format!("pass {}/{} ", i+1, total_passes)
             } else {
                 format!("pass {:2.0}/{:2.0} ", i+1, total_passes)
@@ -484,45 +598,55 @@ fn wipe_file(path: &Path, n_passes: usize, size: Option<u64>,
             PassType::Random => "(random)".to_string(),
             PassType::Pattern(p) => format!("({})", bytes_to_string(p))
         }.as_ref());
+
         logger.print_file_verbose(&log_str);
 
         // size is an optional argument for exactly how many bytes we want to shred
         // Do not fail if writes, stats, or syncs fail; just notify the user and keep going
-        let _ = do_pass(&mut file, *pass_type, size, exact).map_err(|se|
+        let _ = do_pass(&mut file, &metadata, *pass_type, size, exact).map_err(|se|
             logger.print_shred_error(se)
         );
 
-        let _ = file.sync_all().map_err(|e| { // Sync data & metadata to disk after each pass just in case
-            let se = ShredError::FsyncErr(format!("{}/", path.parent_str()),
-                                          e.description().to_string());
+        // Sync data & metadata to disk after each pass just in case
+        let _ = file.sync_all().map_err(|e| {
+            let se = ShredError::FsyncErr(format!("{}", e));
             logger.print_shred_error(se);
         });
-        let _ = file.seek(io::SeekFrom::Start(0)); // This can't fail. Seeking to 0 is always possible
+
+        // Failing to seek is a fatal error; if we cannot seek, we cannot do more than 1 pass
+        match file.seek(io::SeekFrom::Start(0)) {
+            Err(e) => return Err(ShredError::SeekErr(format!("{}", e))),
+            _ => ()
+        }
     }
 
     Ok(())
 }
 
-fn do_pass(file: &mut fs::File, generator_type: PassType,
+fn do_pass(file: &mut fs::File, metadata: &ShredMetadata, generator_type: PassType,
            given_file_size: Option<u64>, exact: bool) -> Result<(), ShredError> {
-           
-    let real_file_size = try!(file.metadata()
-                              .map(|m| m.len())
-                              .map_err(|e| ShredError::StatErr(e.description().to_string()))
-                             );
-    
-    // Recall --size specifies how many bytes we want to shred
-    let generator = match given_file_size {
-        Some(given) => BytesGenerator::new(given, generator_type, exact),
-        None        => BytesGenerator::new(real_file_size, generator_type, exact),
+
+    // How many bytes are going to be used to do one pass on this file; recall --size
+    // specifies how many bytes we want to shred; if not provided, use the file size
+    // from the file's metadata
+    let effective_file_size = match given_file_size {
+        Some(given) => given,
+        None => metadata.size
+    };
+    let generator = match effective_file_size {
+        // No limit; write until an error occurs
+        0 => BytesGenerator::new(None, metadata.block_size, generator_type, exact),
+        // Normal stream
+        _ => BytesGenerator::new(Some(effective_file_size), metadata.block_size, generator_type, exact),
     };
 
     let mut buf_writer = BufWriter::new(file);
-    
+
     for block in generator {
-        try!(buf_writer.write_all(&*block)
-                       .map_err(|e|ShredError::WriteErr(e.description().to_string()))
-        );
+        try! {
+            buf_writer.write_all(&*block)
+                      .map_err(|e| ShredError::WriteErr(format!("{}", e)))
+        }
     }
 
     Ok(())
@@ -539,14 +663,14 @@ fn wipe_name(file_path: &Path, logger: &ShredLogger) -> Result<PathBuf, ShredErr
                    else { p },
         None => Path::new("/")
     };
-    
+
     // make a fs::File for the containing directory so we can call fsync() after every rename
     let dir_file = try!(fs::OpenOptions::new().read(true).open(&dir_path)
-                            .map_err(|e| ShredError::OpenErr(e.description().to_string()))
+                            .map_err(|e| ShredError::OpenErr(format!("{}", e)))
                        );
-    
+
     let mut last_path = file_path.to_path_buf();
-    
+
     for length in (1..basename_len+1).rev() {
         match name_pass(length, &last_path, dir_path) {
             Ok(new_path) => {
@@ -558,8 +682,7 @@ fn wipe_name(file_path: &Path, logger: &ShredLogger) -> Result<PathBuf, ShredErr
         // Sync this change to disk immediately; Note: this is equivalent to the
         // --remove=wipesync option in coreutils' shred. Here, it is the only option
         let _ = dir_file.sync_all().map_err(|e| {
-            let se = ShredError::FsyncErr(format!("{}/", file_path.parent_str()),
-                                          e.description().to_string());
+            let se = ShredError::FsyncErr(format!("{}", e));
             logger.print_shred_error(se);
         });
     }
@@ -578,7 +701,7 @@ fn name_pass(new_name_len: usize, file_path: &Path, dir_path: &Path) -> Result<P
         match fs::rename(&file_path, &new_path) {
             Ok(_) => return Ok(new_path),
             Err(e) => return Err(ShredError::RenameErr(new_path.filename_str(),
-                                                       e.description().to_string()))
+                                                       format!("{}", e)))
         }
     } // If every possible filename already exists, just reduce the length and try again
 
@@ -588,5 +711,5 @@ fn name_pass(new_name_len: usize, file_path: &Path, dir_path: &Path) -> Result<P
 fn remove_file(path: &Path) -> Result<(), ShredError> {
     fs::remove_file(path)
         .map(|_| ())
-        .map_err(|e| ShredError::RemoveErr(e.description().to_string()))
+        .map_err(|e| ShredError::RemoveErr(format!("{}", e)))
 }
