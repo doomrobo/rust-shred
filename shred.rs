@@ -14,7 +14,6 @@
 // MAKE FASTER
 // Add recursive shredding
 // Use direct IO(?)
-// concurrency(?)
 //
 
 extern crate getopts;
@@ -22,6 +21,9 @@ extern crate libc;
 
 extern crate rand;
 use rand::{ThreadRng, Rng};
+
+extern crate scoped_threadpool;
+use scoped_threadpool::Pool;
 
 use std::cell::{Cell, RefCell};
 use std::env;
@@ -35,7 +37,6 @@ use std::path;
 use std::path::{Path, PathBuf};
 use std::io;
 use std::result::Result;
-use std::error::Error;
 
 #[path = "../common/util.rs"]
 #[macro_use]
@@ -94,6 +95,7 @@ impl Display for ShredError {
 }
 
 // Used for verbose and error output
+#[derive(Clone)]
 struct ShredLogger {
     prog_name: String,
     filename: RefCell<String>,
@@ -497,9 +499,13 @@ pub fn main() {
     let prog_name: String = Path::new(&args[0]).filename_str();
 
     let mut opts = getopts::Options::new();
+    opts.optopt("j",
+                "jobs",
+                "Number of files that can be shredded simultaneously; default 1",
+                "JOBS");
     opts.optopt("n",
                 "iterations",
-                "Overwrite N times instead of the default (3)",
+                "Overwrite N times; default 3",
                 "N");
     opts.optopt("s",
                 "size",
@@ -507,7 +513,7 @@ pub fn main() {
                 "FILESIZE");
     opts.optflag("u",
                  "remove",
-                 "Truncate and remove the file after overwriting; see below");
+                 "Truncate and remove the file after overwriting (see below)");
     opts.optflag("v", "verbose", "Show progress");
     opts.optflag("x",
                  "exact",
@@ -552,21 +558,39 @@ pub fn main() {
             None => 3,
         };
 
+        let n_threads: u32 = match matches.opt_str("jobs") {
+            Some(s) => s.parse::<u32>().unwrap_or_else(|_| {
+                eprintln!("{}: Invalid number of jobs", prog_name);
+                exit!(1);
+            }),
+            None => 1,
+        };
+
         let verbose = matches.opt_present("verbose");
 
-        let mut logger = ShredLogger::new(&prog_name, verbose);
+        let logger = ShredLogger::new(&prog_name, verbose);
 
         let remove = matches.opt_present("remove");
         let size = get_size(matches.opt_str("size"), &logger);
         let exact = matches.opt_present("exact") && size.is_none(); // if -s is given, ignore -x
         let zero = matches.opt_present("zero");
 
-        for path_str in matches.free.into_iter() {
-            let path = Path::new(&path_str);
-            logger.set_filename(&path.filename_str());
-            let _ = shred(path, iterations, remove, size, exact, zero, &logger)
-                        .map_err(|se| logger.print_shred_error(se));
-        }
+        // Thread pool size dictated by --jobs
+        let mut pool = Pool::new(n_threads);
+
+        pool.scoped(|scope| {
+            for path_str in matches.free.iter() {
+                let path = Path::new(path_str);
+                // Make a logger for each file and let it be captured by the closure
+                let mut file_logger = logger.clone();
+                file_logger.set_filename(&path.filename_str());
+                // Run each shred in a different thread as long as we have threads to spare
+                scope.execute(move || {
+                    let _ = shred(path, iterations, remove, size, exact, zero, &file_logger)
+                                .map_err(|se| file_logger.print_shred_error(se));
+                });
+            }
+        });
     }
 
     exit!(0);
