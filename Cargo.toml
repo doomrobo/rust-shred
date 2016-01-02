@@ -6,7 +6,7 @@ authors = ["Michael Rosenberg <42micro@gmail.com>"]
 
 [[bin]]
 name = "shred"
-path = "shred.rs"
+path = "src/shred.rs"
 
 [profile.release]
 opt-level = 3

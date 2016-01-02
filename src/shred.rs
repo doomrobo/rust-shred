@@ -38,7 +38,6 @@ use std::path::{Path, PathBuf};
 use std::io;
 use std::result::Result;
 
-#[path = "../common/util.rs"]
 #[macro_use]
 mod util;
 
