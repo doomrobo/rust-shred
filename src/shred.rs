@@ -1,20 +1,11 @@
 #![crate_name = "shred"]
-//
-// This file is part of the uutils coreutils package.
-//
-// (c) Michael Rosenberg <42micro@gmail.com>
-//
-// For the full copyright and license information, please view the LICENSE
-// file that was distributed with this source code.
-//
 
-
-//
-// TODO:
-// MAKE FASTER
-// Add recursive shredding
-// Use direct IO(?)
-//
+/*
+ * TODO:
+ * MAKE FASTER
+ * Add recursive shredding
+ * Use direct IO(?)
+ */
 
 extern crate getopts;
 extern crate libc;
@@ -38,8 +29,20 @@ use std::path::{Path, PathBuf};
 use std::io;
 use std::result::Result;
 
-#[macro_use]
-mod util;
+// Need to upcast to u32, since fs::Metadata::mode returns u32 and the libc constants may be u32 or
+// u16, depending on architecture
+#[cfg(unix)]
+mod consts {
+    use libc;
+    pub const S_IFBLK:  u32 = libc::S_IFBLK  as u32;
+    pub const S_IFCHR:  u32 = libc::S_IFCHR  as u32;
+    pub const S_IFDIR:  u32 = libc::S_IFDIR  as u32;
+    pub const S_IFIFO:  u32 = libc::S_IFIFO  as u32;
+    pub const S_IFLNK:  u32 = libc::S_IFLNK  as u32;
+    pub const S_IFMT:   u32 = libc::S_IFMT   as u32;
+    pub const S_IFREG:  u32 = libc::S_IFREG  as u32;
+    pub const S_IFSOCK: u32 = libc::S_IFSOCK as u32;
+}
 
 static NAME: &'static str = "shred";
 static VERSION_STR: &'static str = env!("CARGO_PKG_VERSION");
@@ -54,6 +57,20 @@ const PATTERNS: [&'static [u8]; 22] = [b"\x00", b"\xFF", b"\x55", b"\xAA", b"\x2
                                        b"\xB6\xDB\x6D", b"\xDB\x6D\xB6", b"\x11", b"\x22", b"\x33",
                                        b"\x44", b"\x66", b"\x77", b"\x88", b"\x99", b"\xBB",
                                        b"\xCC", b"\xDD", b"\xEE"];
+
+macro_rules! eprintln(
+    ($fmt:expr, $($args:tt)*) => ({
+        use std::io::Write;
+        write!(&mut ::std::io::stderr(), concat!($fmt, "\n"), $($args)*).unwrap();
+    })
+);
+
+macro_rules! exit(
+    ($exitcode:expr) => ({
+        use std::process;
+        process::exit($exitcode);
+    })
+);
 
 #[derive(Clone, Copy)]
 enum PassType<'a> {
@@ -78,16 +95,14 @@ impl Display for ShredError {
         use ShredError::*;
         let err_str = match *self {
             NameExhaustion => "Exhausted nameset for renaming".to_string(),
-            Unsupported(ref file_type) =>
-                format!("Unsupported file type: {}", file_type),
+            Unsupported(ref file_type) => format!("Unsupported file type: {}", file_type),
             OpenErr(ref desc) => format!("Couldn't open file: {}", desc),
             RemoveErr(ref desc) => format!("Couldn't remove file: {}", desc),
             StatErr(ref desc) => format!("Couldn't stat file: {}", desc),
             WriteErr(ref desc) => format!("Couldn't write to file: {}", desc),
             FsyncErr(ref desc) => format!("Couldn't fsync file: {}", desc),
             SeekErr(ref desc) => format!("Couldn't seek file to 0: {}", desc),
-            RenameErr(ref to, ref desc) =>
-                format!("Couldn't rename to {}: {}", to, desc),
+            RenameErr(ref to, ref desc) => format!("Couldn't rename to {}: {}", to, desc),
         };
         f.write_str(&err_str)
     }
@@ -160,12 +175,10 @@ impl FilenameStr for path::Path {
 
 impl ParentStr for path::Path {
     fn parent_str(&self) -> String {
-        let s = match self.parent() {
+        match self.parent() {
             Some(path) => path.filename_str(),
             None => String::new(), // Empty string
-        };
-
-        s
+        }
     }
 }
 
@@ -240,8 +253,8 @@ impl Iterator for FilenameGenerator {
     }
 }
 
-// Used to generate blocks of bytes of size <= DEFAULT_BLOCK_SIZE based on either a give pattern
-// or randomness
+// Used to generate blocks of bytes of size <= DEFAULT_BLOCK_SIZE based on either a give pattern or
+// randomness
 struct BytesGenerator<'a> {
     total_bytes: Option<u64>,
     bytes_generated: usize,
@@ -362,7 +375,6 @@ impl Display for FileType {
 }
 
 struct ShredMetadata {
-    file_type: FileType, // Not really necessary; size and block_size are enough
     size: u64,
     block_size: usize, // Only really important for block devices
 }
@@ -391,7 +403,6 @@ fn get_metadata(file: &File) -> Result<ShredMetadata, ShredError> {
     let block_size = DEFAULT_BLOCK_SIZE;
 
     Ok(ShredMetadata {
-        file_type: file_type,
         size: size,
         block_size: block_size,
     })
@@ -400,8 +411,8 @@ fn get_metadata(file: &File) -> Result<ShredMetadata, ShredError> {
 // We can handle block devices and non-tty char devices
 #[cfg(unix)]
 fn get_metadata(file: &File) -> Result<ShredMetadata, ShredError> {
-    use libc::consts::os::posix88::*;
-    use libc::funcs::posix88::unistd::isatty;
+    use consts::*;
+    use libc::isatty;
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::io::AsRawFd;
 
@@ -412,6 +423,7 @@ fn get_metadata(file: &File) -> Result<ShredMetadata, ShredError> {
         Err(e) => return Err(ShredError::StatErr(format!("{}", e))),
         Ok(m) => m,
     };
+
     let file_type = match fs_metadata.mode() & S_IFMT {
         S_IFREG => FileType::RegFile,
         S_IFDIR => FileType::Dir,
@@ -447,14 +459,14 @@ fn get_metadata(file: &File) -> Result<ShredMetadata, ShredError> {
     };
 
     Ok(ShredMetadata {
-        file_type: file_type,
         size: size,
         block_size: block_size,
     })
 }
 
 
-// Stolen and tweaked from ../du/du.rs by Joseph Crail. Thanks!
+// Stolen and tweaked from https://github.com/uutils/coreutils/blob/master/src/du/du.rs by
+// Joseph Crail. Thanks!
 fn get_size(size_str_opt: Option<String>, logger: &ShredLogger) -> Option<u64> {
     if size_str_opt.is_none() {
         return None;
@@ -524,8 +536,7 @@ pub fn main() {
     opts.optflag("", "help", "Display this help and exit");
     opts.optflag("", "version", "Output version information and exit");
 
-    // Vec::tail() is unstable; use [1..] instead
-    let matches = opts.parse(args[1..].iter()).unwrap_or_else(|e| {
+    let matches = opts.parse(args.iter().skip(1)).unwrap_or_else(|e| {
         eprintln!("{}: {}", prog_name, e);
         exit!(1);
     });
@@ -578,7 +589,7 @@ pub fn main() {
         let mut pool = Pool::new(n_threads);
 
         pool.scoped(|scope| {
-            for path_str in matches.free.iter() {
+            for path_str in &matches.free {
                 let path = Path::new(path_str);
                 // Make a logger for each file and let it be captured by the closure
                 let mut file_logger = logger.clone();
@@ -649,16 +660,18 @@ fn wipe_file(path: &Path,
         let remainder = n_passes % PATTERNS.len();
 
         for _ in 0..n_full_arrays {
-            for p in PATTERNS.iter() {
+            for p in &PATTERNS {
                 pass_sequence.push(PassType::Pattern(*p));
             }
         }
-        for i in 0..remainder {
-            pass_sequence.push(PassType::Pattern(PATTERNS[i]));
+        for p in PATTERNS.iter().take(remainder) {
+            pass_sequence.push(PassType::Pattern(p));
         }
-        rand::thread_rng().shuffle(&mut pass_sequence); // randomize the order of application
+        // randomize the order of application
+        rand::thread_rng().shuffle(&mut pass_sequence);
 
-        let n_random: usize = 3 + n_passes / 10; // Minimum 3 random passes; ratio of 10 after
+        // Minimum 3 random passes; ratio of 10 after
+        let n_random: usize = 3 + n_passes / 10;
         // Evenly space random passes; ensures one at the beginning and end
         for i in 0..n_random {
             pass_sequence[i * (n_passes - 1) / (n_random - 1)] = PassType::Random;
@@ -689,8 +702,8 @@ fn wipe_file(path: &Path,
 
         logger.print_file_verbose(&log_str);
 
-        // size is an optional argument for exactly how many bytes we want to shred. Do not fail
-        // if writes, stats, or syncs fail; just notify the user and keep going
+        // size is an optional argument for exactly how many bytes we want to shred. Do not fail if
+        // writes, stats, or syncs fail; just notify the user and keep going
         let _ = do_pass(&mut file, &metadata, *pass_type, size, exact)
                     .map_err(|se| logger.print_shred_error(se));
 
@@ -701,9 +714,8 @@ fn wipe_file(path: &Path,
         });
 
         // Failing to seek is a fatal error; if we cannot seek, we cannot do more than 1 pass
-        match file.seek(io::SeekFrom::Start(0)) {
-            Err(e) => return Err(ShredError::SeekErr(format!("{}", e))),
-            _ => (),
+        if let Err(e) = file.seek(io::SeekFrom::Start(0)) {
+            return Err(ShredError::SeekErr(format!("{}", e)));
         }
     }
 
@@ -717,9 +729,8 @@ fn do_pass(file: &mut fs::File,
            exact: bool)
            -> Result<(), ShredError> {
 
-    // How many bytes are going to be used to do one pass on this file; recall --size
-    // specifies how many bytes we want to shred; if not provided, use the file size
-    // from the file's metadata
+    // How many bytes are going to be used to do one pass on this file; recall --size specifies how
+    // many bytes we want to shred; if not provided, use the file size from the file's metadata
     let effective_file_size = match given_file_size {
         Some(given) => given,
         None => metadata.size,
@@ -748,8 +759,8 @@ fn do_pass(file: &mut fs::File,
     Ok(())
 }
 
-// Repeatedly renames the file with strings of decreasing length (most likely
-// all 0s). Return the path of the file after its last renaming or None if error
+// Repeatedly renames the file with strings of decreasing length (most likely all 0s). Return the
+// path of the file after its last renaming or None if error
 fn wipe_name(file_path: &Path, logger: &ShredLogger) -> Result<PathBuf, ShredError> {
     let basename_len: usize = file_path.filename_str().len();
     let dir_path = match file_path.parent() {
@@ -777,8 +788,8 @@ fn wipe_name(file_path: &Path, logger: &ShredLogger) -> Result<PathBuf, ShredErr
             }
             Err(se) => logger.print_shred_error(se),
         }
-        // Sync this change to disk immediately; Note: this is equivalent to the
-        // --remove=wipesync option in coreutils' shred. Here, it is the only option
+        // Sync this change to disk immediately; Note: this is equivalent to the --remove=wipesync
+        // option in coreutils' shred. Here, it is the only option
         let _ = dir_file.sync_all().map_err(|e| {
             let se = ShredError::FsyncErr(format!("{}", e));
             logger.print_shred_error(se);
@@ -796,8 +807,7 @@ fn name_pass(new_name_len: usize,
     for name in FilenameGenerator::new(new_name_len) {
         let new_path = dir_path.join(&name);
 
-        // Check if the new path already exists. If it's already
-        // taken, move along
+        // Check if the new path already exists. If it's already taken, move along
         if fs::metadata(&new_path).is_ok() {
             continue;
         }
